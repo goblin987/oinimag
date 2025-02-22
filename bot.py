@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configuration
-TOKEN = '7770681728:AAHfiSsbREtVz0t9oBH032nPaybnUcfbKb4'
+TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_CHAT_ID = '6705617539'  # Your user ID
 GROUP_CHAT_ID = '-1001381982408'
 TIMEZONE = pytz.timezone('Europe/Vilnius')  # Lithuania timezone
