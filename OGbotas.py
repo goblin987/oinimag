@@ -22,7 +22,8 @@ logger.info(f"Running on Python {sys.version}")
 # Get sensitive information from environment variables
 TOKEN = os.getenv('TELEGRAM_TOKEN')
 ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
-GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')  # Default group for scheduled messages, can be any group
+GROUP_CHAT_ID = os.getenv('GROUP_CHAT_ID')
+PASSWORD = os.getenv('PASSWORD', 'shoebot123')  # Default password or fetch from env if needed
 
 # Check if required environment variables are set
 if not TOKEN:
@@ -41,23 +42,26 @@ COINFLIP_STICKER_ID = 'CAACAgIAAxkBAAEN32tnuPb-ovynJR5WNO1TQyv_ea17DwAC-RkAAtswE
 
 # Data loading and saving functions
 def load_data(filename, default):
+    filepath = f"/opt/render/data/{filename}"
     try:
-        if os.path.exists(filename) and os.path.getsize(filename) > 0:
-            with open(filename, 'rb') as f:
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+            with open(filepath, 'rb') as f:
                 return pickle.load(f)
         return default
     except (FileNotFoundError, EOFError, pickle.UnpicklingError):
         return default
 
 def save_data(data, filename):
+    filepath = f"/opt/render/data/{filename}"
     if isinstance(data, defaultdict):
         data = dict(data)
     try:
-        with open(filename, 'wb') as f:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, 'wb') as f:
             pickle.dump(data, f)
-        logger.info(f"Saved data to {filename}")
+        logger.info(f"Saved data to {filepath}")
     except Exception as e:
-        logger.error(f"Failed to save {filename}: {str(e)}")
+        logger.error(f"Failed to save {filepath}: {str(e)}")
 
 # Load initial data
 featured_media_id = load_data('featured_media_id.pkl', None)
@@ -109,8 +113,14 @@ alltime_messages = load_data('alltime_messages.pkl', defaultdict(int))
 chat_streaks = load_data('chat_streaks.pkl', defaultdict(int))
 last_chat_day_raw = load_data('last_chat_day.pkl', {})
 last_chat_day = defaultdict(lambda: datetime.min.replace(tzinfo=TIMEZONE), last_chat_day_raw)
+allowed_groups = {GROUP_CHAT_ID}
+valid_licenses = {'LICENSE-XYZ123', 'LICENSE-ABC456'}
+pending_activation = {}
 username_to_id = {}
 polls = {}
+
+def is_allowed_group(chat_id: str) -> bool:
+    return str(chat_id) in allowed_groups
 
 # Message deletion function
 async def delete_message_job(context: telegram.ext.CallbackContext):
@@ -155,14 +165,47 @@ async def whoami(update: telegram.Update, context: telegram.ext.ContextTypes.DEF
 async def startas(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     user_id = update.message.from_user.id
-    if chat_id != user_id:  # Group chat
-        msg = await update.message.reply_text(
-            "Sveiki! Use /balsuoju to vote for sellers with buttons. /nepatiko for downvotes (5 pts). "
-            "Chat daily for 1-3 pts + streaks. Check /barygos, /chatking, /coinflip, or /apklausa!"
-        )
-        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
-    else:  # Private chat
-        await update.message.reply_text("Sveiki! Pridėk mane į grupę ir naudok /startas ten!")
+    if chat_id != user_id:
+        if is_allowed_group(chat_id):
+            msg = await update.message.reply_text(
+                "Sveiki! Use /balsuoju to vote for sellers with buttons. /nepatiko for downvotes (5 pts). "
+                "Chat daily for 1-3 pts + streaks. Check /barygos, /chatking, /coinflip, or /apklausa!"
+            )
+            context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        else:
+            msg = await update.message.reply_text("Šis botas skirtas tik mano grupėms! Siųsk /startas Password privačiai!")
+            context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+    else:
+        try:
+            password = context.args[0]
+            if password == PASSWORD:
+                pending_activation[user_id] = "password"
+                await update.message.reply_text("Slaptažodis teisingas! Siųsk /activate_group GroupChatID.")
+            else:
+                await update.message.reply_text("Neteisingas slaptažodis!")
+        except IndexError:
+            await update.message.reply_text("Naudok: /startas Password privačiai!")
+
+async def activate_group(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    if str(user_id) != ADMIN_CHAT_ID:
+        await update.message.reply_text("Tik adminas gali aktyvuoti grupes!")
+        return
+    if user_id not in pending_activation:
+        await update.message.reply_text("Pirma įvesk slaptažodį privačiai!")
+        return
+    try:
+        group_id = context.args[0]
+        if group_id in allowed_groups:
+            await update.message.reply_text("Grupė jau aktyvuota!")
+        else:
+            allowed_groups.add(group_id)
+            if pending_activation[user_id] != "password":
+                valid_licenses.remove(pending_activation[user_id])
+            del pending_activation[user_id]
+            await update.message.reply_text(f"Grupė {group_id} aktyvuota! Use /startas in the group.")
+    except IndexError:
+        await update.message.reply_text("Naudok: /activate_group GroupChatID")
 
 async def privatus(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.message.from_user.id)
@@ -171,6 +214,10 @@ async def privatus(update: telegram.Update, context: telegram.ext.ContextTypes.D
         context.job_queue.run_once(delete_message_job, 45, context=(update.message.chat_id, msg.message_id))
         return
     chat_id = update.message.chat_id
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     keyboard = [[InlineKeyboardButton("Valdyti privačiai", url=f"https://t.me/{context.bot.username}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     msg = await update.message.reply_text("Spausk mygtuką, kad valdytum botą privačiai:", reply_markup=reply_markup)
@@ -212,6 +259,11 @@ async def balsuoju(update: telegram.Update, context: telegram.ext.ContextTypes.D
     chat_id = update.message.chat_id
     user_id = update.message.from_user.id
 
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
+
     keyboard = [[InlineKeyboardButton(seller, callback_data=f"vote_{seller}")] for seller in trusted_sellers]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -224,6 +276,7 @@ async def balsuoju(update: telegram.Update, context: telegram.ext.ContextTypes.D
             msg = await context.bot.send_video(chat_id=user_id, video=featured_media_id, caption=pardavejai_message, reply_markup=reply_markup)
         else:
             msg = await context.bot.send_message(chat_id=user_id, text=pardavejai_message, reply_markup=reply_markup)
+        # Store message ID in context for later deletion
         context.user_data['balsuoju_message_id'] = (msg.chat_id, msg.message_id)
         logger.info(f"/balsuoju called by user_id={user_id}, buttons sent privately, message_id={msg.message_id}")
     except telegram.error.Unauthorized:
@@ -343,7 +396,7 @@ async def handle_vote_button(update: telegram.Update, context: telegram.ext.Cont
         logger.error(f"Message is None for user_id={user_id}, callback_data={query.data}")
         return
     
-    chat_id = query.message.chat_id
+    chat_id = query.message.chat_id  # This will be the private chat_id
     data = query.data
 
     logger.info(f"Vote attempt by user_id={user_id} in chat_id={chat_id}, callback_data={data}")
@@ -355,7 +408,8 @@ async def handle_vote_button(update: telegram.Update, context: telegram.ext.Cont
     seller = data.replace("vote_", "")
     if seller not in trusted_sellers:
         await query.answer("Šis pardavėjas nebegalioja!")
-        logger.warning(f"Attempt to vote for invalid seller '{seller}' by user_id={user_id}")
+        logger.warning(f"Attempt to vote for invalid seller '{seller}' by user_id={user_id}. Trusted sellers: {trusted_sellers}")
+        # Delete the message even if the seller is invalid
         if 'balsuoju_message_id' in context.user_data:
             chat_id, message_id = context.user_data['balsuoju_message_id']
             context.job_queue.run_once(delete_message_job, 5, context=(chat_id, message_id))
@@ -369,6 +423,7 @@ async def handle_vote_button(update: telegram.Update, context: telegram.ext.Cont
         days_left = max(1, int(cooldown_remaining.total_seconds() // 86400))
         await query.answer(f"Tu jau balsavai! Liko {days_left} dienų iki kito balsavimo.")
         await context.bot.send_message(chat_id=chat_id, text=f"Tu jau balsavai! Liko {days_left} dienų iki kito balsavimo.")
+        # Delete the balsuoju message after showing cooldown
         if 'balsuoju_message_id' in context.user_data:
             chat_id, message_id = context.user_data['balsuoju_message_id']
             context.job_queue.run_once(delete_message_job, 5, context=(chat_id, message_id))
@@ -381,6 +436,8 @@ async def handle_vote_button(update: telegram.Update, context: telegram.ext.Cont
     votes_alltime.setdefault(seller, 0)
     votes_monthly.setdefault(seller, [])
 
+    logger.info(f"Before vote: user_id={user_id}, points={user_points[user_id]}, votes_weekly[{seller}]={votes_weekly[seller]}, votes_alltime[{seller}]={votes_alltime[seller]}")
+
     votes_weekly[seller] += 1
     votes_monthly[seller].append((now, 1))
     votes_alltime[seller] += 1
@@ -389,9 +446,12 @@ async def handle_vote_button(update: telegram.Update, context: telegram.ext.Cont
     user_points[user_id] += 5
     last_vote_attempt[user_id] = now
 
+    logger.info(f"After vote: user_id={user_id}, points={user_points[user_id]}, votes_weekly[{seller}]={votes_weekly[seller]}, votes_alltime[{seller}]={votes_alltime[seller]}")
+
     await query.answer("Ačiū už jūsų balsą, 5 taškai buvo pridėti prie jūsų sąskaitos.")
     await query.edit_message_text(f"Ačiū už jūsų balsą už {seller}, 5 taškai pridėti!")
     
+    # Delete the balsuoju message after successful vote
     if 'balsuoju_message_id' in context.user_data:
         chat_id, message_id = context.user_data['balsuoju_message_id']
         context.job_queue.run_once(delete_message_job, 5, context=(chat_id, message_id))
@@ -406,6 +466,11 @@ async def handle_vote_button(update: telegram.Update, context: telegram.ext.Cont
 async def apklausa(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     user_id = update.message.from_user.id
+
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
 
     try:
         question = " ".join(context.args)
@@ -424,6 +489,7 @@ async def apklausa(update: telegram.Update, context: telegram.ext.ContextTypes.D
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(f"📊 Apklausa: {question}", reply_markup=reply_markup)
+        # No deletion scheduled for /apklausa
     except IndexError:
         msg = await update.message.reply_text("Naudok: /apklausa 'Klausimas'")
         context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
@@ -443,7 +509,10 @@ async def handle_poll_button(update: telegram.Update, context: telegram.ext.Cont
         return
 
     poll_id, vote = parts[0][5:], parts[1]
+    logger.info(f"Poll button pressed: data={data}, poll_id={poll_id}, vote={vote}, polls.keys={list(polls.keys())}")
+
     if poll_id not in polls:
+        logger.error(f"Poll ID {poll_id} not found in polls: {polls}")
         await query.answer("Ši apklausa nebegalioja!")
         return
 
@@ -474,6 +543,11 @@ async def nepatiko(update: telegram.Update, context: telegram.ext.ContextTypes.D
     chat_id = update.message.chat_id
     user_id = update.message.from_user.id
     
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
+    
     now = datetime.now(TIMEZONE)
     if now - last_downvote_attempt[user_id] < timedelta(days=7):
         msg = await update.message.reply_text("Palauk 7 dienas po paskutinio nepritarimo!")
@@ -483,7 +557,7 @@ async def nepatiko(update: telegram.Update, context: telegram.ext.ContextTypes.D
     try:
         vendor = context.args[0]
         if not vendor.startswith('@'):
-            vendor = '@' + vendor
+            vendor = '@' + vendor  # Normalize by adding '@'
         reason = " ".join(context.args[1:])
         if not reason:
             msg = await update.message.reply_text("Prašau nurodyti priežastį!")
@@ -514,6 +588,10 @@ async def approve(update: telegram.Update, context: telegram.ext.ContextTypes.DE
     chat_id = update.message.chat_id
     if user_id != ADMIN_CHAT_ID:
         return
+    if not (is_allowed_group(chat_id) or chat_id == int(user_id)):
+        msg = await update.message.reply_text("Ši komanda veikia tik grupėje arba privačiai!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     try:
         cid = int(context.args[0])
         if cid not in pending_downvotes:
@@ -542,10 +620,14 @@ async def addseller(update: telegram.Update, context: telegram.ext.ContextTypes.
         msg = await update.message.reply_text("Tik adminas gali pridėti pardavėją!")
         context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
         return
+    if not is_allowed_group(chat_id) and chat_id != int(user_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje arba naudok privačiai!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     try:
         vendor = context.args[0]
         if not vendor.startswith('@'):
-            vendor = '@' + vendor
+            vendor = '@' + vendor  # Normalize by adding '@'
         if vendor in trusted_sellers:
             msg = await update.message.reply_text(f"{vendor} jau yra patikimų pardavėjų sąraše!")
             context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
@@ -564,10 +646,14 @@ async def removeseller(update: telegram.Update, context: telegram.ext.ContextTyp
         msg = await update.message.reply_text("Tik adminas gali pašalinti pardavėją!")
         context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
         return
+    if not is_allowed_group(chat_id) and chat_id != int(user_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje arba naudok privačiai!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     try:
         vendor = context.args[0]
         if not vendor.startswith('@'):
-            vendor = '@' + vendor
+            vendor = '@' + vendor  # Normalize by adding '@'
         if vendor not in trusted_sellers:
             msg = await update.message.reply_text(f"'{vendor}' nėra patikimų pardavėjų sąraše! Sąrašas: {trusted_sellers}")
             context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
@@ -587,10 +673,14 @@ async def removeseller(update: telegram.Update, context: telegram.ext.ContextTyp
 
 async def sellerinfo(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     try:
         vendor = context.args[0]
         if not vendor.startswith('@'):
-            vendor = '@' + vendor
+            vendor = '@' + vendor  # Normalize by adding '@'
         if vendor not in trusted_sellers:
             msg = await update.message.reply_text(f"{vendor} nėra patikimas pardavėjas!")
             context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
@@ -607,6 +697,10 @@ async def sellerinfo(update: telegram.Update, context: telegram.ext.ContextTypes
 
 async def barygos(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     now = datetime.now(TIMEZONE)
     
     message = ""
@@ -618,8 +712,8 @@ async def barygos(update: telegram.Update, context: telegram.ext.ContextTypes.DE
         weekly_board += "Dar nėra balsų šią savaitę!\n"
     else:
         sorted_weekly = sorted(votes_weekly.items(), key=lambda x: x[1], reverse=True)
-        for vendor, score in sorted_weekly:
-            weekly_board += f"{vendor[1:]}: {score}\n"
+        for vendor, score in sorted_weekly:  # Show all sellers
+            weekly_board += f"{vendor[1:]}: {score}\n"  # Remove @ from vendor name
     
     monthly_board = "📅 Mėnesio Top Pardavėjai 📅\n"
     monthly_totals = defaultdict(int)
@@ -630,16 +724,16 @@ async def barygos(update: telegram.Update, context: telegram.ext.ContextTypes.DE
         monthly_board += "Nėra balsų per 30 dienų!\n"
     else:
         sorted_monthly = sorted(monthly_totals.items(), key=lambda x: x[1], reverse=True)
-        for vendor, score in sorted_monthly[:15]:
-            monthly_board += f"{vendor[1:]}: {score}\n"
+        for vendor, score in sorted_monthly[:15]:  # Show top 15 sellers
+            monthly_board += f"{vendor[1:]}: {score}\n"  # Remove @ from vendor name
     
     alltime_board = "🌟 Visų Laikų Top 10 Pardavėjai 🌟\n"
     if not votes_alltime:
         alltime_board += "Dar nėra balsų!\n"
     else:
         sorted_alltime = sorted(votes_alltime.items(), key=lambda x: x[1], reverse=True)
-        for i, (vendor, score) in enumerate(sorted_alltime[:10], 1):
-            alltime_board += f"{i}. {vendor[1:]}: {score}\n"
+        for i, (vendor, score) in enumerate(sorted_alltime[:10], 1):  # Show top 10 sellers
+            alltime_board += f"{i}. {vendor[1:]}: {score}\n"  # Remove @ from vendor name
     
     full_message = f"{message}{weekly_board}\n{monthly_board}\n{alltime_board}"
     if 'barygos_media_id' in globals() and barygos_media_id and barygos_media_type:
@@ -655,6 +749,10 @@ async def barygos(update: telegram.Update, context: telegram.ext.ContextTypes.DE
 
 async def chatking(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     
     if not alltime_messages:
         msg = await update.message.reply_text("Dar nėra žinučių!")
@@ -676,7 +774,7 @@ async def chatking(update: telegram.Update, context: telegram.ext.ContextTypes.D
 
 async def handle_message(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
-    if update.message.text.startswith('/'):
+    if not is_allowed_group(chat_id) or update.message.text.startswith('/'):
         return
     user_id = update.message.from_user.id
     username = update.message.from_user.username
@@ -747,6 +845,10 @@ async def weekly_recap(context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
 
 async def coinflip(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        return
     initiator_id = update.message.from_user.id
     try:
         amount = int(context.args[0])
@@ -845,7 +947,7 @@ async def pridetitaskus(update: telegram.Update, context: telegram.ext.ContextTy
     try:
         seller = context.args[0]
         if not seller.startswith('@'):
-            seller = '@' + seller
+            seller = '@' + seller  # Normalize by adding '@'
         amount = int(context.args[1])
         if seller not in trusted_sellers:
             msg = await update.message.reply_text(f"{seller} nėra patikimų pardavėjų sąraše!")
@@ -862,10 +964,19 @@ async def pridetitaskus(update: telegram.Update, context: telegram.ext.ContextTy
 async def points(update: telegram.Update, context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     user_id = update.message.from_user.id
+    logger.info(f"/points called by user_id={user_id} in chat_id={chat_id}")
+
+    if not is_allowed_group(chat_id):
+        msg = await update.message.reply_text("Botas neveikia šioje grupėje!")
+        context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+        logger.warning(f"Chat_id={chat_id} not in allowed_groups={allowed_groups}")
+        return
+
     points = user_points.get(user_id, 0)
     streak = chat_streaks.get(user_id, 0)
     msg = await update.message.reply_text(f"Jūsų taškai: {points}\nSerija: {streak} dienų")
     context.job_queue.run_once(delete_message_job, 45, context=(chat_id, msg.message_id))
+    logger.info(f"Points for user_id={user_id}: {points}, Streak: {streak}")
 
 async def reset_votes(context: telegram.ext.ContextTypes.DEFAULT_TYPE) -> None:
     global votes_weekly, voters, downvoters, pending_downvotes, complaint_id, last_vote_attempt
@@ -886,6 +997,7 @@ async def reset_monthly_votes(context: telegram.ext.ContextTypes.DEFAULT_TYPE) -
 
 # Add handlers
 application.add_handler(CommandHandler(['startas'], startas))
+application.add_handler(CommandHandler(['activate_group'], activate_group))
 application.add_handler(CommandHandler(['nepatiko'], nepatiko))
 application.add_handler(CommandHandler(['approve'], approve))
 application.add_handler(CommandHandler(['addseller'], addseller))
@@ -904,7 +1016,7 @@ application.add_handler(CommandHandler(['whoami'], whoami))
 application.add_handler(CommandHandler(['addftbaryga'], addftbaryga))
 application.add_handler(CommandHandler(['addftbaryga2'], addftbaryga2))
 application.add_handler(CommandHandler(['editpardavejai'], editpardavejai))
-application.add_handler(CommandHandler(['ap Inclusionlausa'], apklausa))
+application.add_handler(CommandHandler(['apklausa'], apklausa))  # Fixed: Corrected from 'ap Inclusionlausa' to 'apklausa'
 application.add_handler(CommandHandler(['privatus'], privatus))
 application.add_handler(MessageHandler(filters.Regex('^/start$') & filters.ChatType.PRIVATE, start_private))
 application.add_handler(CallbackQueryHandler(handle_vote_button, pattern="vote_"))
